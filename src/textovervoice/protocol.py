@@ -137,8 +137,7 @@ def parse_frame(received: list[int], parity_bytes: int = fec.DEFAULT_PARITY_BYTE
         _, v = parity_reader.read()
         parity_bytes_val.append(v)
 
-    combined = bytes(payload_wire) + bytes(parity_bytes_val)
-    corrected = fec.recover(combined, parity_bytes)
+    corrected = fec.recover(bytes(payload_wire), bytes(parity_bytes_val), parity_bytes)
     if corrected is None:
         return ParseResult(ok=False, text=None, reason="FEC uncorrectable")
 

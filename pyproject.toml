@@ -11,6 +11,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
+acoustic-test = ["sounddevice"]  # tools/codec_validation/acoustic_loopback_test.py
 
 [project.scripts]
 textovervoice = "textovervoice.cli:main"
