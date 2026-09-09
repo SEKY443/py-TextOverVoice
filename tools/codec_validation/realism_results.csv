@@ -1,0 +1,45 @@
+test,bitrate,n,errors,rate,detail
+isolated_symbol,4.75k,64,1,0.0156,low_group_errors=0 high_group_errors=1
+isolated_symbol,7.40k,64,0,0.0000,low_group_errors=0 high_group_errors=0
+isolated_symbol,12.2k,64,0,0.0000,low_group_errors=0 high_group_errors=0
+sequence_full_alphabet,4.75k,64,3,0.0469,
+sequence_full_alphabet,7.40k,64,0,0.0000,
+sequence_full_alphabet,12.2k,64,0,0.0000,
+symbol_duration,4.75k,32,9,0.2812,duration_ms=20 (aligned to 20ms AMR frame)
+symbol_duration,4.75k,32,5,0.1562,duration_ms=30 (misaligned to 20ms AMR frame)
+symbol_duration,4.75k,32,2,0.0625,duration_ms=40 (aligned to 20ms AMR frame)
+symbol_duration,4.75k,32,1,0.0312,duration_ms=60 (aligned to 20ms AMR frame)
+symbol_duration,4.75k,32,0,0.0000,duration_ms=80 (aligned to 20ms AMR frame)
+symbol_duration,4.75k,32,0,0.0000,duration_ms=100 (aligned to 20ms AMR frame)
+symbol_duration,12.2k,32,0,0.0000,duration_ms=20 (aligned to 20ms AMR frame)
+symbol_duration,12.2k,32,0,0.0000,duration_ms=30 (misaligned to 20ms AMR frame)
+symbol_duration,12.2k,32,0,0.0000,duration_ms=40 (aligned to 20ms AMR frame)
+symbol_duration,12.2k,32,0,0.0000,duration_ms=60 (aligned to 20ms AMR frame)
+symbol_duration,12.2k,32,0,0.0000,duration_ms=80 (aligned to 20ms AMR frame)
+symbol_duration,12.2k,32,0,0.0000,duration_ms=100 (aligned to 20ms AMR frame)
+noise_robustness,4.75k,96,3,0.0312,snr_db=30 repeats=3
+noise_robustness,4.75k,96,1,0.0104,snr_db=20 repeats=3
+noise_robustness,4.75k,96,0,0.0000,snr_db=15 repeats=3
+noise_robustness,4.75k,96,0,0.0000,snr_db=10 repeats=3
+noise_robustness,4.75k,96,1,0.0104,snr_db=5 repeats=3
+noise_robustness,4.75k,96,6,0.0625,snr_db=0 repeats=3
+noise_robustness,12.2k,96,0,0.0000,snr_db=30 repeats=3
+noise_robustness,12.2k,96,0,0.0000,snr_db=20 repeats=3
+noise_robustness,12.2k,96,0,0.0000,snr_db=15 repeats=3
+noise_robustness,12.2k,96,0,0.0000,snr_db=10 repeats=3
+noise_robustness,12.2k,96,0,0.0000,snr_db=5 repeats=3
+noise_robustness,12.2k,96,0,0.0000,snr_db=0 repeats=3
+tandem_codec,4.75k,32,0,0.0000,passes=1
+tandem_codec,4.75k,32,4,0.1250,passes=2
+tandem_codec,4.75k,32,9,0.2812,passes=3
+tandem_codec,12.2k,32,0,0.0000,passes=1
+tandem_codec,12.2k,32,0,0.0000,passes=2
+tandem_codec,12.2k,32,0,0.0000,passes=3
+end_to_end_text,4.75k,40,1,0.0250,sample=ascii fec=none exact_match=False text_matches=False
+end_to_end_text,4.75k,50,2,0.0400,sample=ascii fec=RS10 exact_match=True text_matches=True
+end_to_end_text,12.2k,40,0,0.0000,sample=ascii fec=none exact_match=True text_matches=True
+end_to_end_text,12.2k,50,0,0.0000,sample=ascii fec=RS10 exact_match=True text_matches=True
+end_to_end_text,4.75k,66,3,0.0455,sample=cjk fec=none exact_match=False text_matches=False
+end_to_end_text,4.75k,76,3,0.0395,sample=cjk fec=RS10 exact_match=True text_matches=True
+end_to_end_text,12.2k,66,0,0.0000,sample=cjk fec=none exact_match=True text_matches=True
+end_to_end_text,12.2k,76,0,0.0000,sample=cjk fec=RS10 exact_match=True text_matches=True
