@@ -113,24 +113,35 @@ PREAMBLE_BACKOFF_S = 0.1   # see cli.py's PREAMBLE_BACKOFF_S
 def send(text: str, mode: str = "phone", parity_bytes: int = 10,
          dest_id: int = BROADCAST_ID, session_key: bytes | None = None,
          device: int | None = None, max_frame_chars: int = message.MAX_FRAME_CHARS,
-         display_text: str | None = None) -> None:
+         display_text: str | None = None, repeat: int = 1) -> None:
     """display_text overrides what's logged for the ">> Sending" line --
     for callers (chat.py) that wrap `text` in non-printing control
     characters (a hidden message-id tag) which would otherwise show up
-    concatenated into the visible log with no separator."""
+    concatenated into the visible log with no separator.
+
+    `repeat` retransmits the exact same frame set (same seq numbers) back
+    to back -- see cli.py's encode() docstring for why this is a safe,
+    receiver-transparent way to recover from per-frame loss on a lossy
+    real acoustic channel: MessageReassembler already tolerates a seq
+    arriving more than once, so a frame dropped in one pass just needs to
+    survive any other pass."""
     import sounddevice as sd
 
     profile = modem.MODES[mode]
     frames = message.build_message(text, parity_bytes, dest_id=dest_id, session_key=session_key,
                                     max_frame_chars=max_frame_chars)
     inter_frame_silence = np.zeros(int(0.3 * DEVICE_SR))
+    inter_repeat_silence = np.zeros(int(0.6 * DEVICE_SR))
 
     audio_parts = []
-    for frame_codes in frames:
-        symbols = modem.bytes_to_symbols(bytes(frame_codes))
-        audio_parts.append(modem.modulate_frame(symbols, symbol_duration_s=profile["symbol_duration_s"],
-                                                  guard_s=profile["guard_s"], sr=DEVICE_SR))
-        audio_parts.append(inter_frame_silence)
+    for rep in range(repeat):
+        if rep > 0:
+            audio_parts.append(inter_repeat_silence)
+        for frame_codes in frames:
+            symbols = modem.bytes_to_symbols(bytes(frame_codes))
+            audio_parts.append(modem.modulate_frame(symbols, symbol_duration_s=profile["symbol_duration_s"],
+                                                      guard_s=profile["guard_s"], sr=DEVICE_SR))
+            audio_parts.append(inter_frame_silence)
     audio = np.concatenate(audio_parts)
 
     extras = []
@@ -138,6 +149,8 @@ def send(text: str, mode: str = "phone", parity_bytes: int = 10,
         extras.append(f"dest_id={dest_id}")
     if session_key is not None:
         extras.append("encrypted")
+    if repeat > 1:
+        extras.append(f"x{repeat} repeats")
     extra_str = f" [{', '.join(extras)}]" if extras else ""
     print(f">> Sending ({len(audio)/DEVICE_SR:.2f}s, mode={mode}, {len(frames)} frame(s)){extra_str}: "
           f"{display_text if display_text is not None else text}", file=sys.stderr)
@@ -161,6 +174,7 @@ class Listener:
         self._preamble_ref = modem.generate_preamble(sr=DEVICE_SR)
 
         self._buffer = np.zeros(0, dtype=np.float64)
+        self._pending_chunks: list[np.ndarray] = []  # see _audio_callback/_merge_pending
         self._lock = threading.Lock()
         self._processed_until = 0   # confirmed/resolved up to here -- safe to trim before this
         self._scan_position = 0     # scanned-with-nothing-found up to here -- see _try_decode
@@ -168,9 +182,32 @@ class Listener:
         self._reassembler = message.MessageReassembler()
 
     def _audio_callback(self, indata, frames, time_info, status) -> None:
+        """Must return fast -- PortAudio calls this on a real-time audio
+        thread and expects it back well within one buffer's duration, or
+        the driver drops samples. So this ONLY appends to a plain list
+        (O(1)); the expensive part (materializing self._buffer) happens in
+        _merge_pending, called once per _try_decode poll instead of once
+        per callback. An earlier version concatenated straight into
+        self._buffer here, copying the ENTIRE buffer on every callback
+        (far more frequent than the 0.3s poll interval) -- cost grew with
+        the buffer's total size, so the session slowed down quadratically
+        the longer it ran. Confirmed via CPU measurement (59.5% mid-session
+        down to 1-3% after this fix) and via a raw recording of the
+        identical transmission decoding 100% correctly offline, which
+        ruled out the acoustic channel and scanner as the cause."""
         chunk = indata[:, 0].astype(np.float64)
         with self._lock:
-            self._buffer = np.concatenate([self._buffer, chunk])
+            self._pending_chunks.append(chunk)
+
+    def _merge_pending(self) -> None:
+        """Folds chunks accumulated by _audio_callback since the last call
+        into self._buffer, and applies the trim -- see _audio_callback's
+        docstring for why this is done here (once per poll) instead of
+        inside the callback itself."""
+        with self._lock:
+            if self._pending_chunks:
+                self._buffer = np.concatenate([self._buffer, *self._pending_chunks])
+                self._pending_chunks = []
             headroom = DEVICE_SR * 2  # keep 2s before processed_until as safety margin
             if self._processed_until > headroom:
                 trim = self._processed_until - headroom
@@ -227,6 +264,7 @@ class Listener:
         return result, exact_end
 
     def _try_decode(self) -> None:
+        self._merge_pending()
         search_window_n = int(SEARCH_WINDOW_S * DEVICE_SR)
         preamble_len_n = int(modem.PREAMBLE_DURATION_S * DEVICE_SR)
         with self._lock:
@@ -237,14 +275,18 @@ class Listener:
         if found is None:
             # Nothing in this window -- advance the scan position so the
             # next poll looks at newly-arrived audio instead of re-scanning
-            # the same stale window forever. Without this, a fixed window
-            # anchored at processed_until never moves without a resolved
-            # detection, so audio arriving beyond it would be silently
-            # unreachable (a real bug this fixes -- e.g. the user just
-            # taking a while to type their next message). Leave a
-            # preamble-length overlap so a chirp straddling this window's
-            # trailing edge isn't split across two separate scans.
-            if len(tail) > preamble_len_n:
+            # the same stale window forever (with a preamble-length overlap
+            # so a chirp straddling this window's trailing edge isn't split
+            # across two scans). Only advance on a FULL, untruncated window
+            # though: near the live real-time edge, `tail` can be shorter
+            # than search_window_n simply because the rest hasn't arrived
+            # from the microphone yet, not because there's nothing there --
+            # advancing past a preamble that's still mid-arrival loses it
+            # for good, since nothing ever scans backward. This was a real,
+            # confirmed race (the same real transmission dropped a
+            # different set of frames on consecutive runs), not a
+            # theoretical concern.
+            if len(tail) == search_window_n:
                 with self._lock:
                     self._scan_position = max(self._scan_position, scan_start + len(tail) - preamble_len_n)
             return

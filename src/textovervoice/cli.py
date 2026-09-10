@@ -49,36 +49,27 @@ PREAMBLE_BACKOFF_S = 0.1  # safety margin subtracted from the calculated next-fr
                            # mismatch (real audio doesn't preserve exact counts)
                            # can't cause the search to start inside the next
                            # preamble instead of right before it. Kept small
-                           # (not 1.0s, which an earlier version used) so it
-                           # can't overshoot backward past SEARCH_WINDOW_S's
-                           # span -- see that constant's comment.
+                           # enough to stay within SEARCH_WINDOW_S's span.
 SEARCH_WINDOW_S = 0.6  # bounds each individual preamble search -- kept
-                       # deliberately tiny (not 20s, and definitely not the
-                       # 180s an even earlier version tried) because
-                       # modem.find_preamble returns the single GLOBALLY
-                       # strongest correlation peak in whatever it's given, so
-                       # ANY window that can contain more than one preamble
-                       # risks jumping straight to whichever one correlates
-                       # best overall, skipping nearer frames out of sequence
-                       # entirely. This was caught twice: first on the full
-                       # GPLv3 text at 20s (decode found frame seq=37 before
-                       # seq=0), then again on a 12-frame fast_air message
-                       # with 30-char frames even at the "safe" 20s -- fast
-                       # short frames pack several complete preamble+payload
-                       # cycles into 20s, so the fix wasn't the constant, it
-                       # was the assumption that any single fixed window can
-                       # be "comfortably larger than one frame" for every
-                       # mode/frame-size combination. 0.6s is comfortably
-                       # smaller than the shortest possible frame cycle (a
-                       # near-empty fast_air frame is still ~1.2s: preamble +
-                       # guard + header/CRC/parity symbols + inter-frame
-                       # silence), so it can never contain two preambles.
-                       # _scan_for_preamble below advances through the file in
-                       # overlapping small windows when a given one comes up
-                       # empty, rather than using one large window as the
-                       # primary search mechanism -- with FFT-based
-                       # correlation this costs almost nothing even when it
-                       # takes several iterations to cross a longer gap.
+                       # deliberately tiny because modem.find_preamble returns
+                       # the single GLOBALLY strongest correlation peak in
+                       # whatever it's given, so any window that can contain
+                       # more than one preamble risks jumping straight to
+                       # whichever one correlates best overall, skipping
+                       # nearer frames out of sequence entirely (caught on the
+                       # full GPLv3 text at a "safe-looking" 20s, and again on
+                       # a fast_air/30-char-frame message even at 20s -- short
+                       # frames pack several preamble+payload cycles into a
+                       # window that size). 0.6s is comfortably smaller than
+                       # the shortest possible frame cycle (a near-empty
+                       # fast_air frame is still ~1.2s: preamble + guard +
+                       # header/CRC/parity symbols + inter-frame silence), so
+                       # it can never contain two preambles. _scan_for_preamble
+                       # below advances through the file in overlapping small
+                       # windows when one comes up empty, rather than using
+                       # one large window as the primary search mechanism --
+                       # with FFT-based correlation this costs almost nothing
+                       # even across several iterations.
 
 
 def keygen(priv_path: str, pub_path: str) -> None:
@@ -114,16 +105,34 @@ def _resolve_session_key(args: argparse.Namespace) -> bytes | None:
 
 
 def encode(text: str, out_path: str, parity_bytes: int, symbol_duration: float, guard: float,
-           dest_id: int, session_key: bytes | None, max_frame_chars: int) -> None:
+           dest_id: int, session_key: bytes | None, max_frame_chars: int, repeat: int = 1) -> None:
+    """`repeat` retransmits the exact same frame set (same seq numbers) back
+    to back -- a message-level forward-error-recovery mechanism for lossy
+    channels (real acoustic transmission, worst-case AMR bitrate), distinct
+    from FEC's byte-level correction. It works because MessageReassembler is
+    keyed by seq in a plain dict: receiving seq 3 twice is a harmless
+    overwrite, and completion only needs each seq to arrive *at least once*
+    across however many repeats -- so a frame lost in pass 1 just needs to
+    survive any later pass. No receiver-side change was needed for this;
+    the reassembler was already tolerant of it. See README's "Real acoustic
+    hardware" section for the measurement that motivated this (a long
+    chunked message intermittently lost most of its frames' preambles over
+    a multi-minute single-pass live transmission)."""
     frames = message.build_message(text, parity_bytes, dest_id=dest_id, session_key=session_key,
                                     max_frame_chars=max_frame_chars)
     inter_frame_silence = np.zeros(int(0.3 * modem.SR))  # keeps preambles from running together
+    inter_repeat_silence = np.zeros(int(0.6 * modem.SR))  # a bit more, so a repeat's first
+                                                            # preamble is clearly distinct from
+                                                            # the previous repeat's last frame
 
     audio_parts = []
-    for frame_codes in frames:
-        symbols = modem.bytes_to_symbols(bytes(frame_codes))
-        audio_parts.append(modem.modulate_frame(symbols, symbol_duration_s=symbol_duration, guard_s=guard))
-        audio_parts.append(inter_frame_silence)
+    for rep in range(repeat):
+        if rep > 0:
+            audio_parts.append(inter_repeat_silence)
+        for frame_codes in frames:
+            symbols = modem.bytes_to_symbols(bytes(frame_codes))
+            audio_parts.append(modem.modulate_frame(symbols, symbol_duration_s=symbol_duration, guard_s=guard))
+            audio_parts.append(inter_frame_silence)
     audio = np.concatenate(audio_parts)
 
     wavfile.write(out_path, modem.SR, (audio * 32767).astype(np.int16))
@@ -132,6 +141,8 @@ def encode(text: str, out_path: str, parity_bytes: int, symbol_duration: float, 
         extras.append(f"dest_id={dest_id}")
     if session_key is not None:
         extras.append("encrypted")
+    if repeat > 1:
+        extras.append(f"x{repeat} repeats")
     extra_str = f" [{', '.join(extras)}]" if extras else ""
     print(f"Encoded {len(text)} chars -> {len(frames)} frame(s) -> {out_path} "
           f"({len(audio)/modem.SR:.2f}s total){extra_str}", file=sys.stderr)
@@ -262,6 +273,9 @@ def main() -> None:
                       help="addressee (0-254), default broadcast (everyone accepts)")
     enc.add_argument("--max-frame-chars", type=int, default=message.MAX_FRAME_CHARS,
                       help="split text longer than this into multiple independently-synced frames")
+    enc.add_argument("--repeat", type=int, default=1,
+                      help="retransmit the whole frame set this many times -- a lossy-channel "
+                           "safety net, since the receiver already tolerates repeated seqs")
     _add_crypto_args(enc)
 
     dec = sub.add_parser("decode", help="WAV -> text")
@@ -281,6 +295,9 @@ def main() -> None:
     snd.add_argument("--mode", choices=list(modem.MODES), default="phone")
     snd.add_argument("--dest-id", type=int, default=BROADCAST_ID)
     snd.add_argument("--max-frame-chars", type=int, default=message.MAX_FRAME_CHARS)
+    snd.add_argument("--repeat", type=int, default=1,
+                      help="retransmit the whole frame set this many times -- a lossy-channel "
+                           "safety net, since the receiver already tolerates repeated seqs")
     snd.add_argument("--device", type=int, default=None, help="output device index")
     _add_crypto_args(snd)
 
@@ -310,7 +327,7 @@ def main() -> None:
         from . import live
         session_key = _resolve_session_key(args)
         live.send(args.text, args.mode, args.parity_bytes, args.dest_id, session_key,
-                  args.device, args.max_frame_chars)
+                  args.device, args.max_frame_chars, repeat=args.repeat)
         return
 
     if args.cmd == "listen":
@@ -333,7 +350,7 @@ def main() -> None:
     session_key = _resolve_session_key(args)
     if args.cmd == "encode":
         encode(args.text, args.out_wav, args.parity_bytes, symbol_duration, guard,
-               args.dest_id, session_key, args.max_frame_chars)
+               args.dest_id, session_key, args.max_frame_chars, repeat=args.repeat)
     elif args.cmd == "decode":
         decode(args.in_wav, args.parity_bytes, symbol_duration, guard, args.my_id, session_key)
 

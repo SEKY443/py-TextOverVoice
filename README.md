@@ -261,6 +261,87 @@ here; a long message stitched from many frames over nearly two minutes of
 continuous live audio is not, at least not yet. An honest, unresolved
 real-world limitation — not a synthetic one.
 
+**Mitigation tried: message-level repetition (`--repeat`).** Since
+`MessageReassembler` is keyed by seq in a plain dict, receiving the same
+seq more than once is already a harmless overwrite, and completion only
+needs each seq to arrive *at least once* across however many passes —
+no receiver-side change was needed to exploit this. `encode`/`send` grew
+a `--repeat N` flag that retransmits the identical frame set N times, so
+a frame dropped on one pass gets another independent chance on the next.
+Verified correct digitally first (a unit test simulates a channel that
+drops a different subset of frames on each of 3 passes, no single pass
+complete on its own, full message still reassembles from the union) and
+in a clean encode→decode file round-trip (17 frames × 3 repeats, decode
+correctly stopped after the first complete pass, byte-exact).
+
+Retried live with `--repeat 2` (same `phone`/20-char/parity-20 config as
+the single-pass attempt above): it measurably helped — the second pass
+recovered two frames (`seq=2`, `seq=15`) that the first pass had missed,
+and correctly deduplicated the one frame both passes caught (`seq=6`) —
+but 2 passes wasn't enough to complete the full 17-frame message, since
+the underlying per-frame loss rate on this hardware was severe (roughly
+80% of preambles going undetected per pass, based on the 2-3-of-12-to-17
+figures above). With independent per-pass loss that high, the odds of
+*all* 17 frames surviving *at least one* of only 2 passes are low even
+though any individual frame's odds improve with each extra pass.
+`--repeat` is a real, verified improvement and a reasonable default
+mitigation for any lossy channel, but it wasn't, on its own, a fix for
+this specific loss rate — which turned out to have a root cause worth
+fixing directly instead.
+
+**Root cause: it was never the acoustic channel.** The first suspicion
+was ambient noise, checked with a controlled experiment: pausing
+background music made no difference (the identical set of frames
+succeeded both with and without it), ruling out ambient noise and
+pointing at something deterministic instead. The decisive test: record
+the raw microphone input in parallel with a live send (bypassing the live
+listener entirely), then decode that raw recording *offline* with the
+already-proven exhaustive scanner. Result: **17 of 17 frames, byte-exact**,
+scores in the healthy 0.7–0.8 range — from the exact same physical
+transmission the live listener had only caught 3–4 frames of. That
+isolated the bug to `live.py`'s real-time processing, not the hardware,
+not the room, not background audio.
+
+Two real, confirmed bugs were found and fixed there:
+
+1. **O(N²) buffer growth (the big one).** `Listener._audio_callback` did
+   `self._buffer = np.concatenate([self._buffer, chunk])` on every single
+   audio callback — copying the *entire* accumulated buffer each time.
+   Since PortAudio invokes this callback far more often than the 0.3s
+   poll loop, and the buffer only grows over a session, the cost of every
+   callback increased with total elapsed time: a positive-feedback
+   slowdown that left the real-time capture thread increasingly starved
+   as a transmission went on (confirmed directly: a listener process
+   measured at 59.5% CPU mid-session dropped to 1–3% after the fix, on
+   the identical workload). Fixed by having the callback append to a
+   plain list (O(1)) and only materializing the merged buffer once per
+   poll instead of once per callback.
+2. **A live-only race in the incremental scanner.** When the scanner
+   catches up to the real-time edge of the buffer, the next window it
+   reads can be genuinely shorter than the configured search window —
+   not because there's nothing there, but because the rest hasn't arrived
+   from the microphone yet. The scanner was treating that truncated read
+   the same as a full one and advancing past it, which could permanently
+   skip a preamble that was simply still mid-arrival (nothing ever looks
+   backward once the scan position moves on). Confirmed via instrumented
+   runs: the exact same real transmission dropped a *different* set of
+   frames on consecutive runs, and even adding a `print()` statement
+   changed which frames were lost — the signature of a timing race, not a
+   fixed bug. Fixed by only advancing on a full, untruncated window.
+
+Both fixes are real and verified (unit tests still pass; CPU usage
+measurably dropped). But re-testing after them, live capture of a long,
+many-frame message is still incomplete (an apples-to-apples rerun of the
+same `phone`/30-char config that originally got 2 of 12 frames got 3 of
+12 post-fix) — better, not solved. The retry design itself is close to
+the edge for very short frames: fully resolving one frame requires
+waiting for its entire payload to physically arrive over the microphone
+(there's no way around that), and for a short frame that duration is
+uncomfortably close to the frame's own send-side cadence, leaving little
+slack for detection latency or scheduling jitter before the next frame's
+preamble is already arriving. This remaining gap is real and open — not
+yet root-caused the way the two bugs above were.
+
 ### Real acoustic hardware (speaker → room air → mic)
 
 `phone`/`fast_air` single-frame send/decode, the full two-way `chat` flow
