@@ -5,6 +5,19 @@ and VoIP calling apps like WhatsApp/Discord (Opus) alike — designed to
 survive destructive codec compression and phone/WebRTC-side AEC/noise
 suppression.
 
+## Project status
+
+**This is a prototype, not a production implementation.** It exists to
+validate the underlying approach (modulation scheme, FEC strategy, framing)
+against real codecs and real hardware before committing to a production
+build. The current codebase is Python, chosen for fast iteration during
+this experimentation phase (numpy/scipy for DSP, quick to reshape as the
+design changed); a rewrite in another language is planned once the design
+has settled, for the performance and deployment characteristics a
+prototype-stage Python implementation isn't optimized for. Treat the
+numbers and findings in this document as validated *results*, not as
+commitments about the shape of the eventual production code.
+
 ## Design
 
 - **Modulation**: 2-of-16 dual-tone MFSK (`src/textovervoice/modem.py`) —
@@ -103,54 +116,112 @@ suppression.
   `listen`, and `chat` all do this automatically now
   (`live._prevent_display_sleep`); it's macOS-only and a no-op elsewhere.
 
-### Validated against
+## Experimental results
 
-- **AMR-NB** (cellular): real `ffmpeg` + `libopencore_amrnb` round-trips
-  across all 8 bitrate modes. Byte-exact recovery with FEC at the worst
-  4.75kbps mode; without FEC it fails. See
-  `tools/codec_validation/realism_results.csv` (symbol accuracy, noise
-  robustness, symbol-duration sensitivity, tandem transcoding).
-- **Opus** (WhatsApp/Discord-style VoIP): real `ffmpeg` + `libopus`
-  round-trips at approximated WhatsApp-like (16kHz/16-24kbps) and
-  Discord-like (48kHz/32-64kbps) operating points. 8/8 full-protocol tests
-  passed (ASCII + CJK), with much lower symbol error rates than AMR-NB's
-  worst case (0-1.6% vs. up to 28%) — Opus is measurably less destructive
-  to this signal than AMR-NB. See `tools/codec_validation/opus_survivability.py`.
-  **Not yet tested**: the WebRTC-style noise suppression/AEC layer these
-  apps also run on top of Opus, which specifically targets steady tonal
-  content and could be a real risk independent of codec compression.
-- **Real acoustic hardware** (speaker → room air → mic): `phone`/`fast_air`
-  single-frame send/decode, the full two-way `chat` flow (both directions,
-  as two `AdaptiveChat` instances in one process), and addressing across
-  two genuinely separate OS processes (a `send` and a `listen` process — a
-  wrongly-addressed listener correctly ignores a frame without attempting
-  to decode it) all verified working. Reliability is visibly
-  room-noise-dependent, as expected for any acoustic system. See
-  live.py's docstring for a hard-won, unrelated finding from this testing:
-  macOS can silently hang audio playback after ~30s of no keyboard/mouse
-  activity (a power-saving state, not a bug in this project), which
-  `send`/`listen`/`chat` now work around automatically.
-- **Scale**: the full GPLv3 license text (35,148 chars), split into 44
-  frames, round-trips byte-exact through real AMR-NB at 12.2kbps (best
-  bitrate) with every frame found in correct sequence. At AMR's worst
-  bitrate (4.75kbps), 29/44 frames decode correctly and 15 fail on genuine
-  per-frame FEC/channel errors (not a scanning bug — confirmed by the
-  scanner finding and correctly sequencing all 44 preambles before any
-  per-frame decode is attempted); recovering the rest needs either
-  stronger FEC or frame retransmission, neither implemented yet.
+All numbers below come from real codec round-trips (`ffmpeg` +
+`libopencore_amrnb`/`libopus`) or real speaker/microphone hardware — not
+simulation of channel behavior. Raw data and the scripts that produced it
+are in `tools/codec_validation/`.
+
+### AMR-NB (cellular) — symbol accuracy across all 8 bitrate modes
+
+| Test | 4.75kbps (worst) | 7.40kbps (mid) | 12.2kbps (best) |
+|---|---|---|---|
+| Isolated symbol accuracy (64 symbols) | 1.6% SER | 0% SER | 0% SER |
+| Full-alphabet sequence (64 symbols, one clip) | 4.7% SER | 0% SER | 0% SER |
+| Noise robustness (AWGN, worst tested SNR 0dB) | 6.2% SER | — | 0% SER |
+| Tandem transcoding, 1 → 3 AMR passes | 0% → 12.5% → 28.1% SER | — | 0% throughout |
+| End-to-end text, no FEC | fails (byte errors) | passes | passes |
+| End-to-end text, with RS(n,10) FEC | exact recovery | exact recovery | exact recovery |
+
+Symbol duration matters more than the "align to the 20ms codec frame" rule
+alone suggested: at 4.75kbps, a 20ms symbol (exactly one AMR frame) still
+had **28.1% SER**; 40ms+ dropped to ≤6% regardless of exact alignment. This
+is why `phone` mode uses 40ms.
+
+### Opus (WhatsApp/Discord-style VoIP)
+
+| Profile | Sample rate / bitrate | Symbol error rate | Full-protocol (ASCII+CJK) |
+|---|---|---|---|
+| WhatsApp-like | 16kHz / 16kbps | 1.6% (1/64) | 8/8 pass |
+| WhatsApp-like HQ | 16kHz / 24kbps | 0% | pass |
+| Discord-like | 48kHz / 64kbps | 0% | pass |
+| Discord-like (low) | 48kHz / 32kbps | 0% | pass |
+
+Opus is measurably less destructive to this signal than AMR-NB's worst
+case (0–1.6% vs. up to 28% SER). **Not tested**: the WebRTC-style noise
+suppression/AEC layer these apps also run on top of Opus, which
+specifically targets steady tonal content and could be a real risk
+independent of codec compression alone.
+
+### Throughput (chars/sec), measured via the real modem/protocol code
+
+| Configuration | 19 chars | 68 chars | 251 chars |
+|---|---|---|---|
+| `phone`, plain + dictionary | 6.67 | 16.00 | 15.94 |
+| `phone`, plain, no dictionary | 6.23 | 10.97 | 13.18 |
+| `phone`, encrypted | 3.80 | 7.95 | 11.23 |
+| `fast_air`, plain + dictionary | 12.26 | 30.22 | 31.38 |
+| `fast_air`, plain, no dictionary | 11.52 | 21.09 | 26.01 |
+| `fast_air`, encrypted | 7.04 | 15.11 | 22.11 |
+| ggwave AUDIBLE_NORMAL | 9.95 | — | — |
+| ggwave AUDIBLE_FAST | 14.36 | — | — |
+| ggwave AUDIBLE_FASTEST | 25.81 | — | — |
+
+Dictionary compression's gain scales with how much of the text is long
+common English words: +43% throughput on the 68-char sample (dense with
+words like "government", "information"), only +6% on the 19-char greeting.
+Encryption costs 30–45% throughput (ciphertext isn't dictionary-compressible,
+plus 28 bytes of fixed AEAD overhead) — `fast_air` recovers most of that
+back. See `tools/codec_validation/final_benchmark.py`.
+
+### Scale test: full GPLv3 license text (35,148 characters, 44 frames)
+
+| Bitrate | Result |
+|---|---|
+| AMR-NB 12.2kbps (best) | **44/44 frames, byte-exact reassembly** |
+| AMR-NB 4.75kbps (worst) | 29/44 frames decode correctly; 15 fail on genuine per-frame FEC/channel errors |
+
+The 4.75kbps failures are confirmed to be real channel-error limits, not a
+scanning bug: the preamble scanner correctly finds and sequences all 44
+frames before any per-frame decode is even attempted. Recovering the
+remaining 15 needs stronger FEC or frame retransmission (neither
+implemented yet). This test is also what originally exposed two real bugs
+that are now fixed: a Reed-Solomon chunking error past ~245 bytes, and a
+preamble scanner that could jump to a distant, more-strongly-correlated
+frame instead of the nearest one.
+
+### Real acoustic hardware (speaker → room air → mic)
+
+`phone`/`fast_air` single-frame send/decode, the full two-way `chat` flow
+(both directions, as two `AdaptiveChat` instances in one process), and
+addressing across two genuinely separate OS processes (a wrongly-addressed
+listener correctly ignores a frame without attempting to decode it) all
+verified working. A real-hardware duration sweep found `fast_air`'s 20ms
+symbols perform statistically indistinguishably from `phone`'s 40ms in
+clean acoustic conditions (mean SER ~1–5% either way over repeated trials)
+but degrade sharply below ~15ms (SER jumps to 8–15%) and catastrophically
+below 10ms (40–90%) — this is what set `fast_air`'s timing, not a guess.
+
+One hard-won, unrelated finding from this testing: macOS can silently hang
+audio playback indefinitely after ~30s of no keyboard/mouse activity (a
+power-saving state, not a bug in this project, confirmed via `log show
+--predicate 'process == "coreaudiod"'` during a live hang). `send`,
+`listen`, and `chat` now prevent this automatically.
 
 ### Comparison to ggwave
 
 ggwave (a similar data-over-sound library) has higher raw throughput at its
 fastest setting, but its default protocols use 2013-6098Hz — 66% of that
 energy sits outside the 300-3400Hz telephone band. Tested empirically: it
-failed to decode in all 6 AMR-NB round-trip trials, including at AMR's best
-quality setting, and even failed from 8kHz resampling alone with no
-compression involved. It's built for open-air device-to-device pairing,
-not for fitting inside a phone call's channel — a different problem than
-this project targets. With `fast_air` mode + dictionary compression,
-TextOverVoice's open-air throughput on longer text (30+ chars/sec) matches
-or beats ggwave's fastest mode too.
+failed to decode in **all 6** AMR-NB round-trip trials (3 protocols × 2
+bitrates), including at AMR's best quality setting, and even failed from
+plain 8kHz resampling alone with no compression involved. It's built for
+open-air device-to-device pairing, not for fitting inside a phone call's
+channel — a different problem than this project targets. With `fast_air`
+mode + dictionary compression, TextOverVoice's open-air throughput on
+longer text (30+ chars/sec) matches or beats ggwave's fastest mode too
+(see throughput table above).
 
 **Known gaps**: no handshake/calibration wire-protocol (chat.py's
 recalibration is an application-level convention, not the opcodes reserved
@@ -232,3 +303,7 @@ tests/                    unit tests (no audio, fast)
 tools/                    build_dictionary.py
 tools/codec_validation/   AMR-NB / Opus / acoustic round-trip test scripts + CSV results
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).

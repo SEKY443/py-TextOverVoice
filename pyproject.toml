@@ -3,6 +3,8 @@ name = "textovervoice"
 version = "0.1.0"
 description = "Text transport over voice-grade audio channels (cellular calls and VoIP)"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
     "numpy",
     "scipy",
