@@ -44,29 +44,41 @@ from .protocol import BROADCAST_ID, frame_wire_length, parse_frame
 MAX_SYMBOLS_PER_FRAME = 2000  # generous cap; real frame length always comes
                                # from the LENGTH field, this just bounds how
                                # much audio one demodulate() call chews through
-PREAMBLE_BACKOFF_S = 1.0  # safety margin subtracted from the calculated next-frame
+PREAMBLE_BACKOFF_S = 0.1  # safety margin subtracted from the calculated next-frame
                            # boundary before searching, so a small sample-count
                            # mismatch (real audio doesn't preserve exact counts)
                            # can't cause the search to start inside the next
-                           # preamble instead of right before it
-SEARCH_WINDOW_S = 20  # bounds each individual preamble search -- kept deliberately
-                       # small (not "comfortably larger than one frame", which an
-                       # earlier version tried at 180s and still had this bug).
-                       # modem.find_preamble returns the single GLOBALLY strongest
-                       # correlation peak in whatever it's given, so ANY window
-                       # that can contain more than one preamble risks jumping
-                       # straight to whichever one correlates best overall,
-                       # skipping nearer frames out of sequence entirely (this
-                       # was an actual bug, caught by testing the full GPLv3
-                       # text: decode found frame seq=37 before seq=0, and later,
-                       # even after adding frame_wire_length's exact-jump logic,
-                       # still occasionally skipped frames whenever that jump
-                       # fell back to the cruder preamble-length-only skip). A
-                       # small window can't contain two frames' preambles at
-                       # once; _scan_for_preamble below advances through the
-                       # file in overlapping small windows when a given one
-                       # comes up empty, rather than using one large window as
-                       # the primary search mechanism.
+                           # preamble instead of right before it. Kept small
+                           # (not 1.0s, which an earlier version used) so it
+                           # can't overshoot backward past SEARCH_WINDOW_S's
+                           # span -- see that constant's comment.
+SEARCH_WINDOW_S = 0.6  # bounds each individual preamble search -- kept
+                       # deliberately tiny (not 20s, and definitely not the
+                       # 180s an even earlier version tried) because
+                       # modem.find_preamble returns the single GLOBALLY
+                       # strongest correlation peak in whatever it's given, so
+                       # ANY window that can contain more than one preamble
+                       # risks jumping straight to whichever one correlates
+                       # best overall, skipping nearer frames out of sequence
+                       # entirely. This was caught twice: first on the full
+                       # GPLv3 text at 20s (decode found frame seq=37 before
+                       # seq=0), then again on a 12-frame fast_air message
+                       # with 30-char frames even at the "safe" 20s -- fast
+                       # short frames pack several complete preamble+payload
+                       # cycles into 20s, so the fix wasn't the constant, it
+                       # was the assumption that any single fixed window can
+                       # be "comfortably larger than one frame" for every
+                       # mode/frame-size combination. 0.6s is comfortably
+                       # smaller than the shortest possible frame cycle (a
+                       # near-empty fast_air frame is still ~1.2s: preamble +
+                       # guard + header/CRC/parity symbols + inter-frame
+                       # silence), so it can never contain two preambles.
+                       # _scan_for_preamble below advances through the file in
+                       # overlapping small windows when a given one comes up
+                       # empty, rather than using one large window as the
+                       # primary search mechanism -- with FFT-based
+                       # correlation this costs almost nothing even when it
+                       # takes several iterations to cross a longer gap.
 
 
 def keygen(priv_path: str, pub_path: str) -> None:
@@ -132,7 +144,7 @@ def _scan_for_preamble(audio: np.ndarray, start: int) -> tuple[int, float] | Non
     why a large window is a correctness bug here, not just a performance
     concern. Returns (absolute_sample_offset, score), or None if no
     preamble is found before the end of the file."""
-    search_window_n = SEARCH_WINDOW_S * modem.SR
+    search_window_n = int(SEARCH_WINDOW_S * modem.SR)
     preamble_len_n = int(modem.PREAMBLE_DURATION_S * modem.SR)
     pos = start
     while pos < len(audio):

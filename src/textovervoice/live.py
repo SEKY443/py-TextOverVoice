@@ -98,18 +98,16 @@ DEVICE_SR = 48000
 MAX_SYMBOLS = 2000         # generous cap on one frame's length
 PREAMBLE_TIMEOUT_S = 8.0   # give up on a detected preamble if it never resolves
 POLL_INTERVAL_S = 0.3
-SEARCH_WINDOW_S = 15       # each poll's search window -- kept small for real-time
-                            # responsiveness (measured ~10ms at this size, post-FFT-fix;
-                            # the old direct-convolution find_preamble took 40+ SECONDS
-                            # at cli.py's 180s bulk-file window size, which made live
-                            # polling effectively non-functional). Safe to keep small
-                            # because _try_decode's _scan_position advances through
-                            # unscanned audio incrementally rather than needing one big
-                            # window to contain everything -- a smaller window here also
-                            # can't jump to a wrong out-of-sequence preamble the way an
-                            # oversized one could (see cli.py's SEARCH_WINDOW_S for that
-                            # bug's full story).
-PREAMBLE_BACKOFF_S = 1.0   # see cli.py's PREAMBLE_BACKOFF_S
+SEARCH_WINDOW_S = 0.6      # each poll's search window -- kept tiny (not 15s) so it
+                            # can never contain more than one preamble; see cli.py's
+                            # SEARCH_WINDOW_S for the full story, including the 12-frame
+                            # fast_air/30-char-frame case that broke even at a "safe"
+                            # 20s. _try_decode's _scan_position advances through
+                            # unscanned audio incrementally, so a small window costs
+                            # only a few extra cheap (post-FFT-fix, ~microseconds)
+                            # iterations to cross a longer inter-frame gap -- it does
+                            # not need to contain the whole gap in one shot.
+PREAMBLE_BACKOFF_S = 0.1   # see cli.py's PREAMBLE_BACKOFF_S
 
 
 def send(text: str, mode: str = "phone", parity_bytes: int = 10,
@@ -229,7 +227,7 @@ class Listener:
         return result, exact_end
 
     def _try_decode(self) -> None:
-        search_window_n = SEARCH_WINDOW_S * DEVICE_SR
+        search_window_n = int(SEARCH_WINDOW_S * DEVICE_SR)
         preamble_len_n = int(modem.PREAMBLE_DURATION_S * DEVICE_SR)
         with self._lock:
             scan_start = max(self._processed_until, self._scan_position)

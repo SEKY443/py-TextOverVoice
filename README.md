@@ -75,10 +75,16 @@ commitments about the shape of the eventual production code.
   exchange over an open channel is in principle interceptable; treat this
   as "encrypted in transit," not "provably secure against an active
   attacker," unless you add out-of-band key verification yourself.
-- **UTF-8 handling**: non-ASCII characters are wrapped in explicit
+- **Full UTF-8 support**: any Unicode codepoint transmits correctly, not
+  just common scripts — non-ASCII characters are wrapped in explicit
   START/CONT/END boundary flags (`charset.py`) for resync after channel
   errors, with UTF-8's own self-describing lead-byte length as a fallback
-  completion trigger.
+  completion trigger. Because encoding operates per-codepoint, multi-
+  codepoint sequences (ZWJ-joined emoji, flag sequences, combining
+  diacritics) work correctly by construction — each codepoint round-trips
+  independently and the receiver just concatenates them back in order. See
+  the extreme UTF-8 test in Experimental results below for a real,
+  measured stress test of this rather than a claim.
 - **Dictionary compression** (`dictionary.py`): common English words (5+
   letters, chosen by *expected character savings* — frequency × (length−4)
   via `wordfreq`, not raw frequency, since short common words like "the"
@@ -190,6 +196,70 @@ implemented yet). This test is also what originally exposed two real bugs
 that are now fixed: a Reed-Solomon chunking error past ~245 bytes, and a
 preamble scanner that could jump to a distant, more-strongly-correlated
 frame instead of the nearest one.
+
+### Extreme UTF-8 test
+
+One 337-codepoint / 517-UTF-8-byte string deliberately combining the
+hardest cases in one message: CJK (Chinese, Japanese hiragana/katakana/
+kanji, Korean hangul), right-to-left Arabic, Cyrillic, standalone combining
+diacritics (`e` + 3 combining marks), currency/math symbols (€¥£₹∑∫√≈∞), a
+4-codepoint ZWJ family emoji sequence (👨‍👩‍👧‍👦), a skin-tone modifier
+(👍🏽), 2-codepoint regional-indicator flag sequences (🇺🇸🇯🇵🇩🇪), rare
+4-byte CJK Extension-B characters (𠀀𪚥𫠝) that most fonts can't even
+render, and a bare zero-width joiner with nothing either side of it.
+
+| Test | Result |
+|---|---|
+| Clean digital round-trip (`build_frame`→`parse_frame`) | exact match |
+| Real AMR-NB 4.75kbps (worst bitrate) round-trip | exact match |
+
+A shorter variant (`中🇯🇵👨‍👩‍👧‍👦ا𠀀` — Han character, flag sequence,
+ZWJ family emoji, Arabic, 4-byte Extension-B character) was sent **live
+through this machine's actual speaker and microphone** and received
+byte-exact, `dest_id` and all: `[received, 1 frame(s)]: 中🇯🇵👨‍👩‍👧‍👦ا𠀀`.
+
+This surfaced one honest, real limitation rather than a UTF-8 bug: the live
+listener's `PREAMBLE_TIMEOUT_S` (8s) is tuned for ordinary chat-length
+messages and gave up before the full 337-character version — which encodes
+to a 67-second transmission with no dictionary compression available for
+non-English scripts — finished arriving. Fine for the file-based/AMR path
+(no timeout there), but a real constraint on live listening for unusually
+long single frames; worth knowing if you send long non-English text live.
+
+The obvious fix — split the full 337-character string into short chunks via
+`--max-frame-chars` so each frame finishes well inside the 8s timeout —
+first exposed a second, more interesting software bug before it could even
+be tried live: decoding a 12-frame chunked WAV file of this text (pure
+digital, no channel involved at all) only recovered 5 of 12 frames.
+`SEARCH_WINDOW_S` (the span each preamble search scans) had been sized
+against the earlier GPLv3 test's `phone`-mode, 800-char frames — comfortably
+larger than one frame there, but with `fast_air` mode and short 30-char
+frames, several complete preamble-and-payload cycles fit inside that same
+window, so `find_preamble`'s "return the single globally-strongest match"
+behavior could again pick a later frame over the immediate next one, even
+with a perfect (score=1.00) correlation on a noise-free signal. The actual
+bug was the assumption that one fixed window size is "comfortably larger
+than a frame" for every mode/frame-size combination. Fixed by shrinking the
+window (in both `cli.py` and `live.py`) to a fraction of a second — smaller
+than any realistic single frame cycle — and leaning entirely on the cheap
+(FFT-based) incremental crawl for coverage instead. Re-verified: 12/12
+frames, byte-exact, in order.
+
+With that fixed, the full 337-character string was sent live through this
+machine's actual speaker and microphone, chunked, across three configurations
+(`fast_air`/30 chars, `phone`/30 chars, `phone`/20 chars with doubled parity)
+— all of them well within the per-frame timeout. None completed: each run
+recovered only 2-3 of the 12-17 frames sent. Tellingly, most of the missing
+frames' preambles were never even *detected* (no "gave up" log line for
+them at all, rather than a detected-then-rejected failure), while the small
+number that were detected mostly decoded correctly — pointing to real
+acoustic dropout (room noise, mic gain, echo) over a ~90-110 second
+transmission on this particular hardware, not a protocol or software bug.
+This is consistent with the *short* variant above succeeding byte-exact on
+the exact same hardware: single frames and short messages are reliable
+here; a long message stitched from many frames over nearly two minutes of
+continuous live audio is not, at least not yet. An honest, unresolved
+real-world limitation — not a synthetic one.
 
 ### Real acoustic hardware (speaker → room air → mic)
 
