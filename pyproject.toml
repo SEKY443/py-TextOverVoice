@@ -1,17 +1,23 @@
 [project]
 name = "textovervoice"
 version = "0.1.0"
-description = "Text transport over voice-grade audio channels (phone calls)"
+description = "Text transport over voice-grade audio channels (cellular calls and VoIP)"
 requires-python = ">=3.11"
 dependencies = [
     "numpy",
     "scipy",
     "reedsolo",
+    "cryptography",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest"]
-acoustic-test = ["sounddevice"]  # tools/codec_validation/acoustic_loopback_test.py
+# needed by src/textovervoice/live.py + chat.py (send/listen/chat CLI commands)
+# and tools/codec_validation/acoustic_*.py
+acoustic-test = ["sounddevice"]
+# needed only by tools/build_dictionary.py (regenerating src/textovervoice/data/*.json);
+# not a runtime dependency of the installed package
+dict-build = ["wordfreq"]
 
 [project.scripts]
 textovervoice = "textovervoice.cli:main"
@@ -22,3 +28,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+textovervoice = ["data/*.json"]

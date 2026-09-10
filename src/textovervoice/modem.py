@@ -17,6 +17,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.signal import chirp as _scipy_chirp
+from scipy.signal import fftconvolve as _fftconvolve
 
 SR = 8000  # AMR-NB operates at 8kHz mono; keep the whole pipeline native to that rate
 
@@ -24,12 +26,28 @@ LOW_GROUP = [400, 550, 700, 850, 1000, 1150, 1300, 1450]
 HIGH_GROUP = [1800, 2000, 2200, 2400, 2600, 2800, 3000, 3200]
 BITS_PER_SYMBOL = 6  # log2(8*8)
 
-# Symbol duration needs to be at least ~40ms (2+ AMR frames) -- measured
-# data showed a 20ms symbol still had 28% error rate at AMR's low bitrate
-# despite matching the codec's 20ms frame grid; 40ms+ is needed regardless
-# of exact grid alignment.
-DEFAULT_SYMBOL_DURATION_S = 0.04
-DEFAULT_GUARD_S = 0.01
+# Named timing profiles. "phone" is validated through real AMR-NB (see
+# tools/codec_validation/realism_results.csv); "fast_air" is validated only
+# acoustically (real speaker/mic, no codec) -- it is NOT expected to survive
+# AMR compression, since the AMR frame-boundary constraint that set
+# "phone"'s 40ms floor doesn't apply to fast_air's shorter timing at all.
+#
+# fast_air's duration was picked from a real-hardware sweep (see
+# tools/codec_validation/acoustic_duration_sweep.py), not guessed: 6 trials
+# split between 20ms and 40ms measured comparable symbol-error rates (mean
+# 1.0% vs 3.1%, both within the run's noisy baseline -- 20ms showed *no*
+# measurable degradation from halving the duration). 15ms and below entered
+# a clearly worse regime (12.5%+ SER), and below 10ms was catastrophic
+# (50%+), consistent with 150Hz-spaced tones needing enough samples for the
+# FFT to resolve adjacent bins. 20ms doubles fast_air's raw bitrate over
+# phone mode (240bps vs 120bps) with real hardware evidence behind it.
+MODES = {
+    "phone": {"symbol_duration_s": 0.04, "guard_s": 0.01},
+    "fast_air": {"symbol_duration_s": 0.02, "guard_s": 0.005},
+}
+
+DEFAULT_SYMBOL_DURATION_S = MODES["phone"]["symbol_duration_s"]
+DEFAULT_GUARD_S = MODES["phone"]["guard_s"]
 RAMP_FRACTION = 0.15  # raised-cosine edge, as a fraction of symbol duration
 
 
@@ -133,6 +151,105 @@ def demodulate(audio: np.ndarray, n_symbols: int, symbol_duration_s: float = DEF
             break
         detections.append(detect_symbol(audio[start:end], sr))
     return detections
+
+
+# --- Frame sync: locate symbol 0 in a live capture with no known alignment --
+# A linear chirp cross-correlates sharply against noise/tones (much sharper
+# peak than a single fixed tone would give), which is why it's the standard
+# choice for this in real modems. Prototyped and verified in
+# tools/codec_validation/acoustic_loopback_test.py (3/3 real speaker/mic
+# trials, confidence 174-242x noise floor) before being promoted here as a
+# first-class part of the modem rather than a one-off test script.
+
+PREAMBLE_DURATION_S = 0.25
+PREAMBLE_F0, PREAMBLE_F1 = 800, 3000  # stays inside the 300-3400Hz voice band,
+                                       # so it works for "phone" mode too
+PREAMBLE_GUARD_S = 0.05  # silence between preamble and payload
+
+
+def generate_preamble(duration_s: float = PREAMBLE_DURATION_S, f0: float = PREAMBLE_F0,
+                       f1: float = PREAMBLE_F1, sr: int = SR) -> np.ndarray:
+    n = int(duration_s * sr)
+    t = np.arange(n) / sr
+    sig = _scipy_chirp(t, f0=f0, f1=f1, t1=duration_s, method="linear")
+
+    ramp_n = int(0.1 * n)
+    window = np.ones(n)
+    window[:ramp_n] = 0.5 * (1 - np.cos(np.pi * np.arange(ramp_n) / ramp_n))
+    window[-ramp_n:] = window[:ramp_n][::-1]
+    return (0.6 * sig * window).astype(np.float64)
+
+
+def find_preamble(audio: np.ndarray, reference: np.ndarray | None = None,
+                   min_score: float = 0.4) -> tuple[int, float] | None:
+    """Cross-correlates `audio` against the known preamble chirp, using a
+    normalized cross-correlation coefficient (numerator / sqrt(local window
+    energy * reference energy)) rather than a raw correlation peak. This
+    matters: an earlier version compared the peak against the correlation's
+    own median as a "confidence" score, which false-triggered on pure noise
+    (caught by tests/test_modem_sync.py) -- with many correlation lags, the
+    max of an unrelated-noise correlation can spike several times above the
+    median from ordinary extreme-value statistics, even though nothing
+    actually matched. Normalizing by local energy bounds the score to
+    roughly [-1, 1] with a stable, physically meaningful threshold instead.
+
+    Returns (sample_index_after_preamble, score), or None if no lag's score
+    clears min_score, i.e. sync failed.
+
+    Uses FFT-based correlation (scipy.signal.fftconvolve, O(N log N)) and a
+    cumulative-sum sliding-window energy (O(N)), not np.correlate/np.convolve's
+    direct O(N*M) computation -- measured directly: searching a realistic
+    live-polling window (180s at 48kHz) with the direct method took 40+
+    seconds per call, making real-time listening (modem.py is polled every
+    ~0.3s -- see live.py) effectively non-functional. This is the same
+    numerical result, just computed efficiently."""
+    if reference is None:
+        reference = generate_preamble()
+    n = len(reference)
+    if len(audio) < n:
+        return None
+
+    numerator = _fftconvolve(audio, reference[::-1], mode="valid")
+    cumsum = np.concatenate(([0.0], np.cumsum(audio ** 2)))
+    window_energy = cumsum[n:] - cumsum[:-n]
+    ref_energy = np.sum(reference ** 2)
+    denom = np.sqrt(window_energy * ref_energy) + 1e-12
+    score = numerator / denom
+
+    peak_idx = int(np.argmax(np.abs(score)))
+    peak_score = float(np.abs(score[peak_idx]))
+
+    if peak_score < min_score:
+        return None
+    return peak_idx + n, peak_score
+
+
+def modulate_frame(symbols: list[int], symbol_duration_s: float = DEFAULT_SYMBOL_DURATION_S,
+                    guard_s: float = DEFAULT_GUARD_S, sr: int = SR) -> np.ndarray:
+    """modulate() with a preamble prepended, for transmission into an
+    unknown-alignment channel (a live capture, not a file where symbol 0 is
+    known to start at sample 0)."""
+    preamble = generate_preamble(sr=sr)
+    preamble_guard = np.zeros(int(PREAMBLE_GUARD_S * sr))
+    payload = modulate(symbols, symbol_duration_s, guard_s, sr)
+    return np.concatenate([preamble, preamble_guard, payload])
+
+
+def demodulate_frame(audio: np.ndarray, n_symbols: int,
+                      symbol_duration_s: float = DEFAULT_SYMBOL_DURATION_S,
+                      guard_s: float = DEFAULT_GUARD_S, sr: int = SR,
+                      min_score: float = 0.4) -> tuple[list[SymbolDetection], float] | None:
+    """Finds the preamble, then demodulates the payload that follows it.
+    Returns (detections, sync_score), or None if the preamble wasn't found
+    reliably (caller should treat that as "no frame here yet", e.g. keep
+    listening, rather than a decode failure)."""
+    found = find_preamble(audio, min_score=min_score)
+    if found is None:
+        return None
+    offset, score = found
+    payload_start = offset + int(PREAMBLE_GUARD_S * sr)
+    detections = demodulate(audio[payload_start:], n_symbols, symbol_duration_s, guard_s, sr)
+    return detections, score
 
 
 # --- Bit packing: 8-bit bytes <-> 6-bit symbols -----------------------------

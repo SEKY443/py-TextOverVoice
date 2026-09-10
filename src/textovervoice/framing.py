@@ -63,3 +63,16 @@ class TokenReader:
         if c in codes.RESERVED:
             return "flag", c
         return "data", c
+
+
+def unstuff_bytes(wire_codes: list[int]) -> bytes:
+    """Resolves an entire stuffed wire-code region back to raw bytes --
+    every token is treated as literal data (used for regions that are
+    opaque bytes on purpose, like RS parity or ciphertext, never text with
+    its own flags)."""
+    reader = TokenReader(wire_codes)
+    out = bytearray()
+    while reader:
+        _, v = reader.read()
+        out.append(v)
+    return bytes(out)

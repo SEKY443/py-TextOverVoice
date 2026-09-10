@@ -2,8 +2,9 @@
 
 129/141/143 mark UTF-8 multi-byte character boundaries (charset.py).
 144-157 is a block reserved for frame control / FEC / CRC / ACK-NACK
-(protocol.py, fec.py). ESCAPE (147) drives byte-stuffing (framing.py) so
-that literal data bytes landing in this range can't be confused with the
+(protocol.py, fec.py). 158-159 mark dictionary word substitutions
+(dictionary.py). ESCAPE (147) drives byte-stuffing (framing.py) so that
+literal data bytes landing in this range can't be confused with the
 control codes themselves.
 """
 
@@ -27,6 +28,11 @@ FEC_RESERVED = 155
 ACK = 156
 NACK = 157
 
+# 158-159: dictionary word-substitution flags (dictionary.py). Followed by
+# 3 literal ASCII letters (A-Z, never need escaping) naming the code.
+DICT_LOWER = 158  # word as stored in the dictionary (lowercase)
+DICT_TITLE = 159  # word with its first letter capitalized
+
 # Handshake opcodes
 OP_SYN = 1
 OP_SYN_ACK = 2
@@ -36,7 +42,7 @@ OP_CAL_RESULT = 5
 OP_PARAM = 6
 OP_READY = 7
 
-RESERVED = frozenset({UTF8_START, UTF8_CONT, UTF8_END} | set(range(FEC_SOF, NACK + 1)))
+RESERVED = frozenset({UTF8_START, UTF8_CONT, UTF8_END} | set(range(FEC_SOF, DICT_TITLE + 1)))
 
 ESCAPE_MASK = 0x20  # XOR mask for byte-stuffing; see framing.py
 

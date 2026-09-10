@@ -56,71 +56,88 @@ def _utf8_expected_len(lead_byte: int) -> int:
     return 0
 
 
-def decode_codes(code_stream: list[int]) -> str:
-    """Implements the IDLE / UTF8_ACTIVE state machine. A malformed sequence
-    (unexpected flag, escape at end of stream) aborts only the character in
-    progress and resumes at the next clean boundary, so a single corrupted
-    code doesn't take down the rest of the message.
+class Utf8CharDecoder:
+    """Incremental IDLE / UTF8_ACTIVE state machine: feed it one (kind,
+    value) token at a time (as produced by framing.TokenReader.read()) and
+    it returns a completed character string when one finishes, or None
+    otherwise. Pulled out of decode_codes() as its own class so a caller
+    that has *other* flags to recognize in the same token stream (see
+    dictionary.py's DICT_LOWER/DICT_TITLE) can interleave its own handling
+    with this one, one token at a time, instead of duplicating the whole
+    state machine.
+
+    A malformed sequence (unexpected flag, escape at end of stream) aborts
+    only the character in progress and resumes at the next clean boundary,
+    so a single corrupted code doesn't take down the rest of the message.
 
     Completion is driven primarily by reaching the lead byte's own expected
-    length (see _utf8_expected_len), not by waiting for UTF8_END -- testing
+    length (_utf8_expected_len), not by waiting for UTF8_END -- testing
     showed that relying on END alone means a single lost END flag causes
     every following byte to be swallowed into the buffer forever, since
     nothing else ever signals "character over." Using the self-describing
     length as the primary trigger and END as a redundant confirmation
     recovers cleanly even when END itself is the corrupted part.
     """
-    reader = TokenReader(code_stream)
-    result: list[str] = []
-    buf = bytearray()
-    expected_len = 0
-    in_char = False
 
-    def flush() -> None:
-        nonlocal buf
+    def __init__(self) -> None:
+        self.buf = bytearray()
+        self.expected_len = 0
+        self.in_char = False
+
+    def _flush(self) -> str | None:
         try:
-            result.append(bytes(buf).decode("utf-8"))
+            text = bytes(self.buf).decode("utf-8")
         except UnicodeDecodeError:
-            pass  # drop the malformed character, keep going
-        buf = bytearray()
+            text = None  # drop the malformed character, keep going
+        self.buf = bytearray()
+        return text
 
-    while reader:
-        kind, value = reader.read()
-
-        if not in_char:
+    def feed(self, kind: str, value: int) -> str | None:
+        if not self.in_char:
             if kind == "data":
-                result.append(chr(value))
+                return chr(value)
             elif value == codes.UTF8_START:
-                in_char = True
-                buf = bytearray()
-                expected_len = 0
+                self.in_char = True
+                self.buf = bytearray()
+                self.expected_len = 0
             # stray CONT/END/other flag while idle: nothing to recover, skip
-            continue
+            return None
 
         # in_char == True
         if kind == "data":
-            if not buf:
-                expected_len = _utf8_expected_len(value)
-                if expected_len == 0:
-                    in_char = False  # corrupted lead byte, abandon this char
-                    continue
-            buf.append(value)
-            if len(buf) >= expected_len:
-                flush()
-                in_char = False
+            if not self.buf:
+                self.expected_len = _utf8_expected_len(value)
+                if self.expected_len == 0:
+                    self.in_char = False  # corrupted lead byte, abandon char
+                    return None
+            self.buf.append(value)
+            if len(self.buf) >= self.expected_len:
+                self.in_char = False
+                return self._flush()
+            return None
         elif value == codes.UTF8_CONT:
-            continue  # just a separator; next token is the data byte
+            return None  # just a separator; next token is the data byte
         elif value == codes.UTF8_END:
-            if buf:
-                flush()  # short buffer -> will fail utf-8 decode and drop
-            in_char = False
+            self.in_char = False
+            return self._flush() if self.buf else None
         elif value == codes.UTF8_START:
             # previous character was truncated by an error; restart clean
-            buf = bytearray()
-            expected_len = 0
+            self.buf = bytearray()
+            self.expected_len = 0
+            return None
         else:
-            # frame-layer flag leaking into char data: abort this char
-            in_char = False
-            buf = bytearray()
+            # foreign flag leaking into char data: abort this char
+            self.in_char = False
+            self.buf = bytearray()
+            return None
 
+
+def decode_codes(code_stream: list[int]) -> str:
+    reader = TokenReader(code_stream)
+    decoder = Utf8CharDecoder()
+    result: list[str] = []
+    while reader:
+        ch = decoder.feed(*reader.read())
+        if ch:
+            result.append(ch)
     return "".join(result)

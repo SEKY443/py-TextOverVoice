@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from textovervoice import modem  # noqa: E402
-from amr_harness import roundtrip_amr, AMR_NB_BITRATES  # noqa: E402
+from amr_harness import roundtrip_amr  # noqa: E402
 
 RNG = random.Random(1234)
 REPRESENTATIVE_BITRATES = ["4.75k", "7.40k", "12.2k"]  # worst / mid / best AMR-NB modes
