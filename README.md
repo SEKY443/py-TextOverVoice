@@ -1,133 +1,74 @@
 # TextOverVoice
 
-Text transport over voice-grade audio channels — cellular phone calls (AMR)
-and VoIP calling apps like WhatsApp/Discord (Opus) alike — designed to
-survive destructive codec compression and phone/WebRTC-side AEC/noise
-suppression.
+Text transport over voice-grade audio channels — cellular calls (AMR) and
+VoIP apps like WhatsApp/Discord (Opus) — designed to survive destructive
+codec compression and phone/WebRTC-side AEC/noise suppression.
 
 ## Project status
 
-**This is a prototype, not a production implementation.** It exists to
-validate the underlying approach (modulation scheme, FEC strategy, framing)
-against real codecs and real hardware before committing to a production
-build. The current codebase is Python, chosen for fast iteration during
-this experimentation phase (numpy/scipy for DSP, quick to reshape as the
-design changed); a rewrite in another language is planned once the design
-has settled, for the performance and deployment characteristics a
-prototype-stage Python implementation isn't optimized for. Treat the
-numbers and findings in this document as validated *results*, not as
-commitments about the shape of the eventual production code.
+**Prototype, not production.** Exists to validate the approach (modulation,
+FEC, framing) against real codecs and hardware before committing to a
+production build. Python was chosen for fast iteration (numpy/scipy for
+DSP); a rewrite in another language is planned once the design settles.
+Treat the numbers here as validated *results*, not commitments about the
+eventual production code's shape.
 
 ## Design
 
-- **Modulation**: 2-of-16 dual-tone MFSK (`src/textovervoice/modem.py`) —
-  one symbol = one tone from an 8-frequency low group + one from an
-  8-frequency high group (64 combinations, 6 bits/symbol), inside the
-  300–3400Hz voice band. An earlier 8-simultaneous-tone design was dropped
-  after real AMR-NB round-trips showed it produces more intermodulation
-  distortion than signal at low bitrate; dual-tone stays clear of that
-  failure mode.
-- **Timing profiles** (`modem.MODES`): `phone` (40ms/symbol, validated
-  through real AMR-NB down to its worst 4.75kbps mode) and `fast_air`
-  (20ms/symbol, ~2x faster, acoustic-only — validated on real speaker/mic
-  hardware via a duration sweep, not guessed; not expected to survive AMR's
-  20ms codec-frame quantization the way `phone` does).
-- **Frame sync**: a linear chirp preamble, located via normalized
-  cross-correlation (`modem.generate_preamble`/`find_preamble`/
-  `modulate_frame`/`demodulate_frame`), so a receiver doesn't need to know
-  where symbol 0 starts in a live capture. Verified on real hardware.
-- **Multi-frame messages** (`message.py`): long text is split into multiple
-  independently-preambled frames rather than sent as one giant frame. This
-  exists because of a measured failure mode, not a theoretical one: sending
-  the full GPLv3 text (35KB) as a single frame through real AMR-NB at
-  4.75kbps produced a hard timing-drift "cliff" partway through — a single
-  preamble at the very start can't correct for drift accumulating over a
-  30+ minute transmission. Splitting into shorter frames, each with its own
-  fresh sync point, bounds how far drift can accumulate before it's
-  corrected, and also bounds the blast radius of a corrupted frame header
-  to just that frame instead of the whole message. The scanner that finds
-  each frame's preamble in a long file was itself a source of bugs before
-  it was fixed: `modem.find_preamble` returns the single globally-strongest
-  correlation match in whatever span it's given, so a search window wide
-  enough to contain more than one frame's preamble could jump straight to
-  a distant one and skip nearer frames out of sequence (caught directly by
-  the GPLv3 test: decode found frame seq=37 before seq=0). Fixed by
-  scanning in small, non-overlapping-content windows that structurally
-  can't contain two preambles, advancing incrementally rather than
-  searching one large span up front — verified on the full GPLv3 text:
-  all 44 frames now found in exact sequence, byte-exact reassembly at
-  AMR-NB 12.2kbps.
+- **Modulation**: 2-of-16 dual-tone MFSK (`modem.py`) — one symbol = one
+  low-group tone + one high-group tone (64 combos, 6 bits/symbol), inside
+  the 300–3400Hz voice band. An earlier 8-simultaneous-tone design was
+  dropped after real AMR-NB tests showed too much intermodulation
+  distortion at low bitrate.
+- **Timing profiles** (`modem.MODES`): `phone` (40ms/symbol, AMR-NB
+  validated down to 4.75kbps) and `fast_air` (20ms/symbol, ~2x faster,
+  acoustic-only — not expected to survive AMR's 20ms frame quantization).
+- **Frame sync**: a linear chirp preamble located via normalized
+  cross-correlation, so a receiver doesn't need to know where symbol 0
+  starts in a live capture.
+- **Multi-frame messages** (`message.py`): long text splits into multiple
+  independently-preambled frames instead of one giant frame, so timing
+  drift and header corruption can't compound across the whole message
+  (measured, not theoretical — see GPLv3 scale test below).
 - **Framing**: SOF/DEST_ID/FLAGS/SEQ/LENGTH/PAYLOAD/PARITY/CRC wire format
-  (`protocol.py`), with byte-stuffing (`framing.py`) so literal data bytes
-  can't be confused with reserved control codes.
-- **Addressing**: an optional DEST_ID field (`protocol.build_frame`'s
-  `dest_id`) lets a receiver (`my_id`) ignore frames meant for someone else
-  without running FEC/CRC on them at all — default is broadcast (everyone
-  accepts).
-- **Encryption**: optional X25519 key agreement + ChaCha20-Poly1305 AEAD
-  (`crypto.py`), not RSA-style direct encryption — a raw asymmetric
-  ciphertext (190+ bytes minimum) would dominate transmission time on this
-  channel, so the asymmetric step only derives a shared session key once,
-  and a fast symmetric cipher handles each message (28 bytes of fixed
-  overhead: 12-byte nonce + 16-byte auth tag). Tamper detection and
-  wrong-key rejection are both verified in tests. No built-in peer identity
-  verification (no PKI, no Signal-style safety-number check) — a live key
-  exchange over an open channel is in principle interceptable; treat this
-  as "encrypted in transit," not "provably secure against an active
-  attacker," unless you add out-of-band key verification yourself.
-- **Full UTF-8 support**: any Unicode codepoint transmits correctly, not
-  just common scripts — non-ASCII characters are wrapped in explicit
-  START/CONT/END boundary flags (`charset.py`) for resync after channel
-  errors, with UTF-8's own self-describing lead-byte length as a fallback
-  completion trigger. Because encoding operates per-codepoint, multi-
-  codepoint sequences (ZWJ-joined emoji, flag sequences, combining
-  diacritics) work correctly by construction — each codepoint round-trips
-  independently and the receiver just concatenates them back in order. See
-  the extreme UTF-8 test in Experimental results below for a real,
-  measured stress test of this rather than a claim.
+  (`protocol.py`), with byte-stuffing so data bytes can't collide with
+  control codes.
+- **Addressing**: an optional DEST_ID lets a receiver ignore frames meant
+  for someone else without running FEC/CRC on them — default is broadcast.
+- **Encryption**: X25519 key agreement + ChaCha20-Poly1305 AEAD
+  (`crypto.py`) rather than direct RSA — one asymmetric handshake derives
+  a session key, then a cheap symmetric cipher handles each message (28
+  bytes fixed overhead). No peer identity verification (no PKI/safety
+  numbers) — "encrypted in transit," not proof against an active MITM,
+  unless you add out-of-band key verification yourself.
+- **Full UTF-8 support**: any codepoint round-trips independently via
+  explicit START/CONT/END boundary flags (`charset.py`) plus UTF-8's own
+  lead-byte length as a fallback, so multi-codepoint sequences (ZWJ emoji,
+  flags, combining marks) work by construction. See the extreme UTF-8 test
+  below for a measured stress test.
 - **Dictionary compression** (`dictionary.py`): common English words (5+
-  letters, chosen by *expected character savings* — frequency × (length−4)
-  via `wordfreq`, not raw frequency, since short common words like "the"
-  wouldn't save anything) substitute for a 4-code dictionary hit instead of
-  one code per character. ~35% frame-size reduction measured on ordinary
-  prose. Strictly optional/additive — anything not in the dictionary falls
-  back to per-character encoding unchanged.
-- **Error correction**: Reed-Solomon (via `reedsolo`) + CRC-16 (`fec.py`) —
-  RS corrects burst errors typical of codec/channel loss (chunked to handle
-  payloads past GF(256)'s 255-symbol codeword limit), CRC independently
-  confirms the result is actually right.
-- **Live two-way conversation with adaptive recalibration** (`chat.py`):
-  an experiment, not a formal protocol. Every chat message is tagged with a
-  short id; the peer auto-replies with a lightweight ACK on successful
-  decode. The sender tracks a rolling window of ACK/timeout outcomes and
-  "recalibrates" — stepping to a more robust `(mode, parity_bytes,
-  max_frame_chars)` combination when the recent failure rate is high, and
-  back to a faster one once the channel's been clean for a while. Since the
-  receiver has no other way to know the sender changed settings, the
-  listener just tries every reachable `(mode, parity_bytes)` combination
-  per received frame (cheap — it's re-parsing the same short captured audio
-  a few times) instead of requiring a formal negotiation handshake.
-  Verified working end-to-end on real hardware, both directions, using two
-  `AdaptiveChat` instances in one process (slower than real deployment due
-  to GIL contention between two listener threads, but correctness-proving).
-- **A hard-won, non-obvious fix that matters for any live audio use**:
-  `sd.play()`/`OutputStream.write()` can hang *indefinitely* (not just
-  slowly) if macOS puts the audio subsystem into its
-  "DarkWakeSilenceBuffers" idle power state, which was observed kicking in
-  after ~30s of no keyboard/mouse activity — exactly the situation during
-  an unattended live demo or a long-running `listen`/`chat` session.
-  Confirmed via `log show --predicate 'process == "coreaudiod"'` during a
-  live hang, and fixed by asserting `caffeinate -u` (not a plain
-  `caffeinate`, which only blocks *system* sleep, not this). `send`,
-  `listen`, and `chat` all do this automatically now
-  (`live._prevent_display_sleep`); it's macOS-only and a no-op elsewhere.
+  letters, ranked by frequency × expected character savings) substitute
+  for a 4-code hit instead of one code per character — ~35% frame-size
+  reduction on ordinary prose. Optional/additive.
+- **Error correction**: Reed-Solomon + CRC-16 (`fec.py`) — RS corrects
+  burst errors, CRC independently confirms the result.
+- **Live two-way chat with adaptive recalibration** (`chat.py`): an
+  experiment, not a formal protocol. ACKs drive a rolling failure-rate
+  window that steps the sender to a more (or less) robust
+  `(mode, parity_bytes, max_frame_chars)` combo; the receiver just tries
+  every reachable combo per frame instead of needing a negotiation
+  handshake. Verified end-to-end on real hardware.
+- **Hard-won fix for any live audio use**: `sd.play()` can hang
+  *indefinitely* if macOS puts audio into its "DarkWakeSilenceBuffers"
+  idle state after ~30s of no keyboard/mouse activity. Fixed by asserting
+  `caffeinate -u` automatically in `send`/`listen`/`chat`
+  (macOS-only, no-op elsewhere).
 
 ## Experimental results
 
-All numbers below come from real codec round-trips (`ffmpeg` +
-`libopencore_amrnb`/`libopus`) or real speaker/microphone hardware — not
-simulation of channel behavior. Raw data and the scripts that produced it
-are in `tools/codec_validation/`.
+All numbers come from real codec round-trips (`ffmpeg` +
+`libopencore_amrnb`/`libopus`) or real speaker/microphone hardware, not
+simulation. Raw data and scripts are in `tools/codec_validation/`.
 
 ### AMR-NB (cellular) — symbol accuracy across all 8 bitrate modes
 
@@ -140,10 +81,8 @@ are in `tools/codec_validation/`.
 | End-to-end text, no FEC | fails (byte errors) | passes | passes |
 | End-to-end text, with RS(n,10) FEC | exact recovery | exact recovery | exact recovery |
 
-Symbol duration matters more than the "align to the 20ms codec frame" rule
-alone suggested: at 4.75kbps, a 20ms symbol (exactly one AMR frame) still
-had **28.1% SER**; 40ms+ dropped to ≤6% regardless of exact alignment. This
-is why `phone` mode uses 40ms.
+At 4.75kbps, a 20ms symbol (one AMR frame exactly) still had 28.1% SER;
+40ms+ dropped to ≤6% regardless of alignment — why `phone` mode uses 40ms.
 
 ### Opus (WhatsApp/Discord-style VoIP)
 
@@ -154,13 +93,11 @@ is why `phone` mode uses 40ms.
 | Discord-like | 48kHz / 64kbps | 0% | pass |
 | Discord-like (low) | 48kHz / 32kbps | 0% | pass |
 
-Opus is measurably less destructive to this signal than AMR-NB's worst
-case (0–1.6% vs. up to 28% SER). **Not tested**: the WebRTC-style noise
-suppression/AEC layer these apps also run on top of Opus, which
-specifically targets steady tonal content and could be a real risk
-independent of codec compression alone.
+Opus is measurably less destructive than AMR-NB's worst case. **Not
+tested**: WebRTC-style noise suppression/AEC on top of Opus, which
+specifically targets steady tonal content.
 
-### Throughput (chars/sec), measured via the real modem/protocol code
+### Throughput (chars/sec), real modem/protocol code
 
 | Configuration | 19 chars | 68 chars | 251 chars |
 |---|---|---|---|
@@ -174,12 +111,10 @@ independent of codec compression alone.
 | ggwave AUDIBLE_FAST | 14.36 | — | — |
 | ggwave AUDIBLE_FASTEST | 25.81 | — | — |
 
-Dictionary compression's gain scales with how much of the text is long
-common English words: +43% throughput on the 68-char sample (dense with
-words like "government", "information"), only +6% on the 19-char greeting.
-Encryption costs 30–45% throughput (ciphertext isn't dictionary-compressible,
-plus 28 bytes of fixed AEAD overhead) — `fast_air` recovers most of that
-back. See `tools/codec_validation/final_benchmark.py`.
+Dictionary compression's gain tracks how much text is long common words
+(+43% on a word-dense 68-char sample, +6% on a short greeting). Encryption
+costs 30–45% throughput (ciphertext isn't compressible, plus fixed AEAD
+overhead) — `fast_air` recovers most of that back.
 
 ### Scale test: full GPLv3 license text (35,148 characters, 44 frames)
 
@@ -188,129 +123,84 @@ back. See `tools/codec_validation/final_benchmark.py`.
 | AMR-NB 12.2kbps (best) | **44/44 frames, byte-exact reassembly** |
 | AMR-NB 4.75kbps (worst) | 29/44 frames decode correctly; 15 fail on genuine per-frame FEC/channel errors |
 
-The 4.75kbps failures are confirmed to be real channel-error limits, not a
-scanning bug: the preamble scanner correctly finds and sequences all 44
-frames before any per-frame decode is even attempted. Recovering the
-remaining 15 needs stronger FEC or frame retransmission (neither
-implemented yet). This test is also what originally exposed two real bugs
-that are now fixed: a Reed-Solomon chunking error past ~245 bytes, and a
-preamble scanner that could jump to a distant, more-strongly-correlated
-frame instead of the nearest one.
+The 4.75kbps failures are real channel-error limits, not a scanning bug —
+the preamble scanner correctly sequences all 44 frames before any per-frame
+decode is attempted. This test also exposed and fixed two real bugs: a
+Reed-Solomon chunking error past ~245 bytes, and a preamble scanner that
+could jump to a distant, more-strongly-correlated frame instead of the
+nearest one (`find_preamble` returns the single globally-strongest
+correlation match in whatever span it's given, so too-wide a search window
+could skip frames out of sequence — fixed by scanning small windows that
+structurally can't contain two preambles).
 
 ### Extreme UTF-8 test
 
-One 337-codepoint / 517-UTF-8-byte string deliberately combining the
-hardest cases in one message: CJK (Chinese, Japanese hiragana/katakana/
-kanji, Korean hangul), right-to-left Arabic, Cyrillic, standalone combining
-diacritics (`e` + 3 combining marks), currency/math symbols (€¥£₹∑∫√≈∞), a
-4-codepoint ZWJ family emoji sequence (👨‍👩‍👧‍👦), a skin-tone modifier
-(👍🏽), 2-codepoint regional-indicator flag sequences (🇺🇸🇯🇵🇩🇪), rare
-4-byte CJK Extension-B characters (𠀀𪚥𫠝) that most fonts can't even
-render, and a bare zero-width joiner with nothing either side of it.
+One 337-codepoint / 517-byte string combining CJK, right-to-left Arabic,
+Cyrillic, standalone combining diacritics, currency/math symbols, a
+4-codepoint ZWJ family emoji, a skin-tone modifier, flag sequences, rare
+4-byte CJK Extension-B characters, and a bare zero-width joiner.
 
 | Test | Result |
 |---|---|
-| Clean digital round-trip (`build_frame`→`parse_frame`) | exact match |
+| Clean digital round-trip | exact match |
 | Real AMR-NB 4.75kbps (worst bitrate) round-trip | exact match |
 
-A shorter variant (`中🇯🇵👨‍👩‍👧‍👦ا𠀀` — Han character, flag sequence,
-ZWJ family emoji, Arabic, 4-byte Extension-B character) was sent **live
-through this machine's actual speaker and microphone** and received
-byte-exact, `dest_id` and all. The full 337-character version is a
-67-second single-frame transmission (no dictionary compression available
-for non-English scripts) that exceeds the live listener's
-`PREAMBLE_TIMEOUT_S` (8s, tuned for ordinary chat-length messages) — a
-real constraint on live listening for unusually long single frames, not a
-UTF-8 bug (no issue on the file-based/AMR path, which has no timeout).
+A shorter variant was sent **live through this machine's actual speaker
+and microphone** and received byte-exact. The full 337-character version
+(67s single-frame) exceeds the live listener's 8s `PREAMBLE_TIMEOUT_S` —
+a real live-listening constraint, not a UTF-8 bug (no issue on the
+file-based/AMR path, which has no timeout).
 
-**Chunking to work around that timeout** (`--max-frame-chars`) surfaced
-three real bugs in the live listening path, all now fixed:
+Chunking to work around that timeout (`--max-frame-chars`) surfaced three
+more real bugs in live listening, all fixed:
 
-1. **A second instance of the scanner's window-sizing bug** (see the
-   Design section above): the earlier fix sized `SEARCH_WINDOW_S` against
-   the GPLv3 test's long `phone`-mode frames, but `fast_air` mode's much
-   shorter frames pack several preamble-and-payload cycles into that same
-   window — reproduced with zero channel noise (only 5 of 12 chunked
-   frames decoded from a perfect digital signal). The real bug wasn't the
-   specific constant, it was assuming any single fixed window is
-   "comfortably larger than one frame" for every mode/frame-size
-   combination. Fixed by shrinking the window to a fraction of a second,
-   smaller than any realistic frame, and leaning on the (cheap,
-   FFT-based) incremental crawl for coverage instead. Re-verified: 12/12
-   frames, byte-exact.
+1. **A second instance of the scanner window-sizing bug** above — the
+   fix had been sized against long `phone`-mode frames, but `fast_air`'s
+   short frames pack several preamble cycles into the same window
+   (reproduced with zero channel noise, only 5/12 frames decoded). Fixed
+   by shrinking the window further, below any realistic frame length.
 2. **O(N²) buffer growth in the live listener.** `Listener._audio_callback`
-   rebuilt its *entire* capture buffer via `np.concatenate` on every
-   single audio callback, so per-callback cost grew with total session
-   length and real-time capture fell further behind the longer a
-   transmission ran. Confirmed by CPU measurement (59.5% mid-session,
-   down to 1–3% after the fix) and by a raw mic recording of a failing
-   live transmission decoding 100% correctly *offline* — proving the
-   acoustic channel itself was never the problem. Fixed by batching
-   buffer appends and merging once per poll instead of once per callback.
-3. **A live-only race in the incremental scanner.** When the scanner
-   caught up to the real-time edge of the buffer, a read could come back
-   shorter than the configured window simply because the rest hadn't
-   arrived yet — not because nothing was there. Treating that truncated
-   read the same as a full one risked permanently skipping a preamble
-   still mid-arrival. Confirmed via instrumented runs: the same real
-   transmission dropped a *different* set of frames on consecutive runs.
-   Fixed by only advancing the scan position on a full, untruncated read.
+   rebuilt its *entire* capture buffer on every audio callback, so
+   real-time capture fell further behind the longer a session ran (59.5%
+   CPU mid-session, down to 1–3% after batching appends). Found by
+   recording raw mic audio in parallel and decoding it offline at
+   100% — proving the acoustic channel was never the problem.
+3. **A live-only race in the incremental scanner** — a buffer read
+   truncated only because real-time audio hadn't fully arrived yet could
+   be mistaken for "nothing here" and permanently skip a preamble
+   still mid-transmission. Fixed by only advancing on a full, untruncated
+   read.
 
-All three fixes are real and verified (unit tests pass; CPU usage and
-frame recovery both measurably improved). Live capture of long,
-many-frame messages is better but not fully solved — an apples-to-apples
-rerun of a config that originally decoded 2 of 12 frames live got 3 of
-12 post-fix. The retry design is inherently marginal for short frames:
-resolving one requires waiting for its entire payload to physically
-arrive over the microphone, leaving little slack before the next frame's
-preamble is already arriving. As an additional, general-purpose
-mitigation, `encode`/`send` also gained `--repeat N` (retransmits the
-same frame set N times; the receiver already tolerates a repeated seq
-for free, verified both digitally and live) — helpful, but not
-sufficient on its own at this loss rate. This remaining gap is real and
-open, an honest limitation rather than a synthetic one.
+All three fixes are verified (tests pass, CPU and recovery both measurably
+improved), but live capture of long multi-frame messages is better, not
+solved — resolving one short frame requires waiting for its whole payload
+to physically arrive over the mic, leaving little slack before the next
+frame's preamble arrives. `--repeat N` (blind whole-message retransmission,
+exploiting that the receiver already tolerates a repeated seq for free)
+helps but isn't sufficient alone at this loss rate. An open, honest gap.
 
 ### Real acoustic hardware (speaker → room air → mic)
 
-`phone`/`fast_air` single-frame send/decode, the full two-way `chat` flow
-(both directions, as two `AdaptiveChat` instances in one process), and
-addressing across two genuinely separate OS processes (a wrongly-addressed
-listener correctly ignores a frame without attempting to decode it) all
-verified working. A real-hardware duration sweep found `fast_air`'s 20ms
-symbols perform statistically indistinguishably from `phone`'s 40ms in
-clean acoustic conditions (mean SER ~1–5% either way over repeated trials)
-but degrade sharply below ~15ms (SER jumps to 8–15%) and catastrophically
-below 10ms (40–90%) — this is what set `fast_air`'s timing, not a guess.
-
-One hard-won, unrelated finding from this testing: macOS can silently hang
-audio playback indefinitely after ~30s of no keyboard/mouse activity (a
-power-saving state, not a bug in this project, confirmed via `log show
---predicate 'process == "coreaudiod"'` during a live hang). `send`,
-`listen`, and `chat` now prevent this automatically.
+`phone`/`fast_air` send/decode, two-way `chat`, and addressing across
+separate OS processes all verified working. A duration sweep found
+`fast_air`'s 20ms symbols match `phone`'s 40ms in clean conditions (~1–5%
+SER either way) but degrade sharply below 15ms (8–15%) and catastrophically
+below 10ms (40–90%) — what set `fast_air`'s timing.
 
 ### Comparison to ggwave
 
-ggwave (a similar data-over-sound library) has higher raw throughput at its
-fastest setting, but its default protocols use 2013-6098Hz — 66% of that
-energy sits outside the 300-3400Hz telephone band. Tested empirically: it
-failed to decode in **all 6** AMR-NB round-trip trials (3 protocols × 2
-bitrates), including at AMR's best quality setting, and even failed from
-plain 8kHz resampling alone with no compression involved. It's built for
-open-air device-to-device pairing, not for fitting inside a phone call's
-channel — a different problem than this project targets. With `fast_air`
-mode + dictionary compression, TextOverVoice's open-air throughput on
-longer text (30+ chars/sec) matches or beats ggwave's fastest mode too
-(see throughput table above).
+ggwave has higher raw throughput at its fastest setting, but its default
+protocols put 66% of their energy outside the 300–3400Hz telephone band —
+it failed to decode in all 6 AMR-NB round-trip trials tested, even at
+AMR's best quality. It targets open-air device pairing, a different
+problem. `fast_air` + dictionary compression matches or beats ggwave's
+fastest mode on longer text (see throughput table).
 
 **Known gaps**: no handshake/calibration wire-protocol (chat.py's
-recalibration is an application-level convention, not the opcodes reserved
-in `codes.py`), no selective/ACK-driven retransmission of just the frames
-that were lost (`--repeat` resends the *whole* message blindly, which
-works but wastes airtime on frames that already got through), and the
-LENGTH/marker header bytes in a frame still aren't FEC-protected (a
-corrupted header byte fails that frame outright even if its payload was
-recoverable) — multi-frame splitting bounds the damage to one frame
-instead of a whole message, but doesn't eliminate it.
+recalibration is an app-level convention, not reserved opcodes), no
+selective/ACK-driven retransmission (`--repeat` resends the whole message
+blindly), and frame header bytes aren't FEC-protected (a corrupted header
+fails that whole frame even if the payload was recoverable).
 
 ## Setup
 
@@ -319,9 +209,7 @@ python3 -m venv .venv
 ./.venv/bin/pip install -e ".[dev]"
 ```
 
-Codec validation scripts need `ffmpeg-full` (for the `libopencore_amrnb`
-encoder and `libopus`; the stock `ffmpeg` Homebrew formula doesn't include
-the AMR encoder):
+Codec validation needs `ffmpeg-full` (stock `ffmpeg` lacks the AMR encoder):
 
 ```
 brew install ffmpeg-full
@@ -335,7 +223,7 @@ Live audio (`send`/`listen`/`chat`) needs:
 
 ## Usage
 
-Offline, file-based (no live audio needed):
+Offline, file-based:
 
 ```
 ./.venv/bin/textovervoice encode "Hello, 你好" out.wav              # phone mode (default)
